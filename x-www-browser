@@ -1,0 +1,4 @@
+#!/bin/sh
+SOCKETPATH="$HOME/.cache/lxcwatch.socket"
+echo "$*" | nc -U "$SOCKETPATH" || \
+    zenity --info --title="Browser Request" --no-markup --text="$*"

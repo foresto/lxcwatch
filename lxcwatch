@@ -1,0 +1,704 @@
+#!/usr/bin/env python3
+
+"""
+A system tray icon for watching processes in linux containers.
+
+To Do:
+
+"""
+
+from bisect import bisect_left
+import ctypes
+import functools
+import getpass
+import os
+import os.path
+import re
+import signal
+import socket
+import stat
+import sys
+from urllib.parse import urlparse
+import webbrowser
+
+#pylint:disable=wrong-import-position
+import gi
+gi.require_version('GdkPixbuf', '2.0')
+from gi.repository import GdkPixbuf
+from gi.repository import Gio
+from gi.repository import GLib
+gi.require_version('Gtk', '3.0')
+from gi.repository import Gtk
+
+PROGRAM_NAME = os.path.basename(sys.argv[0])
+PROGRAM_DIR = os.path.dirname(os.path.realpath(sys.argv[0]))
+ICON_OFF_NAME = 'server-off.svg'
+ICON_ON_NAME = 'server-on.svg'
+INDICATOR_ID = PROGRAM_NAME + "-indicator"
+CONFIG_DIR = os.path.join(
+    os.environ.get('XDG_CONFIG_HOME') or os.path.expanduser("~/.config"),
+    PROGRAM_NAME)
+
+
+def load_uid_ranges():
+    "Return the user's real and subordinate user IDs as an iterable of ranges."
+    uid = os.getuid()
+    usernames = {getpass.getuser(), str(uid)}
+    ranges = {range(uid, uid + 1)}
+
+    try:
+        for line in open("/etc/subuid"):
+            user, subuid, count = line.split(':')
+            if user in usernames:
+                ranges.add(range(int(subuid), int(subuid) + int(count)))
+    except FileNotFoundError:
+        pass
+    return ranges
+
+
+def load_icon_pixbuf(fname):
+    "Return a GdkPixbuf.Pixbuf for the named icon, or None."
+    for path in (
+        os.path.join(PROGRAM_DIR, fname),
+        os.path.join(os.path.expanduser('~/.local/share/icons'), fname),
+        os.path.join('/usr/share/icons/hicolor/scalable/status', fname)):
+
+        if os.path.exists(path):
+            return GdkPixbuf.Pixbuf.new_from_file(path)
+
+    return None
+
+
+class InputReader:
+    """GLib.IOChannel reader and line parser.
+
+    GLib Notes:
+    - io_add_watch() events are edge-triggered unless the callback returns True.
+    - io_add_watch() callbacks receive a copy of the original IOChannel object,
+      not a reference to it, because GLib uses pass-by-copy for such structs.
+    - io_add_watch() can produce a phantom IO_IN event after the IO_HUP event
+      if the event source is not removed and the same file descriptor is reused.
+    - A child-process-exited event can trigger before we finish reading child
+      output if child_watch_add() was called with a priority superior to ours.
+      Solution: Use PRIORITY_DEFAULT (or lower) when calling child_watch_add().
+    - IOChannel.read_chars() returns empty data and causes segfaults, at least
+      when used with unbuffered spawn_async() pipes.
+      Solution: use the (deprecated) read() method instead.
+    """
+    MAX_SIZE = 1024 * 100
+
+    def __init__(self, fd, *, name=None):
+        """Initialize with file descriptor and callbacks.
+
+        :param fd:          File descriptor that will produce data.
+        :type  fd:          int
+        :param name:        A name for this reader.
+        :type  name:        str or None
+        """
+        GLib.unix_set_fd_nonblocking(fd, True)
+        self._channel = GLib.IOChannel.unix_new(fd)
+        self._channel.set_encoding(None)
+        self._channel.set_buffered(False)
+
+        # We use PRIORITY_DEFAULT - 1 so that our watch events will fire
+        # before any child process exit events that use PRIORITY_DEFAULT.
+        GLib.io_add_watch(self._channel, GLib.PRIORITY_DEFAULT - 1,
+            GLib.IO_IN | GLib.IO_HUP, self._ready)
+
+        self.name = name or repr(self)
+
+    def _ready(self, channel, condition):
+        "Handle an input/hup event."
+
+        if condition & GLib.IO_IN:
+            self._on_data(channel.read(self.MAX_SIZE))
+
+        if condition & GLib.IO_HUP:
+            self._close()
+            return False # Remove the event source
+
+        return True # Keep the event source
+
+    def _on_data(self, data):
+        "Process some incoming data."
+        raise NotImplementedError
+
+    def _close(self):
+        "Close the IOChannel and perform any final cleanup."
+        self._channel.close()
+
+
+class InputLineReader(InputReader):
+    """GLib.IOChannel line reader.
+    """
+    def __init__(self, fd, online, onexcess=None, *, name=None):
+        """Initialize with file descriptor and callbacks.
+
+        :param fd:          File descriptor that will produce data.
+        :type  fd:          int
+        :param online:      Callback for a complete line.
+        :type  online:      callable(bytes)
+        :param onexcess:    Callback for an oversize line fragment.
+        :type  onexcess:    callable(bytes) or None
+        :param name:        A name for this reader.
+        :type  name:        str or None
+        """
+        super().__init__(fd, name=name)
+
+        self._parts = []
+        self._partsize = 0
+        self._excess = False
+
+        self._online = online
+        self._onexcess = onexcess
+
+    def _on_data(self, data):
+        "Process some incoming data."
+        for part in data.splitlines(True):
+
+            if self._parts:
+                if self._parts[-1].endswith(b'\r') and part != b'\n':
+                    self._flush()
+
+            if self._partsize + len(part) > self.MAX_SIZE:
+                self._flush(excess=True)
+            self._parts.append(part)
+            self._partsize += len(part)
+
+            if self._parts[-1].endswith(b'\n'):
+                self._flush()
+
+    def _flush(self, excess=False):
+        "Process and empty any buffered line parts."
+        if excess or self._excess:
+            if self._onexcess:
+                for part in self._parts:
+                    self._onexcess(part)
+        elif self._parts:
+            self._online(b''.join(self._parts))
+
+        self._parts = []
+        self._partsize = 0
+        self._excess = excess
+
+    def _close(self):
+        "Close the IOChannel and perform any final cleanup."
+        self._flush()
+        super()._close()
+
+
+class InputCaptor(InputReader):
+    """GLib.IOChannel reader and buffer.
+    """
+    def __init__(self, fd, *, name=None):
+        super().__init__(fd, name=name)
+        self._buf = []
+        self._bufsize = 0
+        self.data = None
+        self.excess = 0   # Number of bytes dropped after MAX_SIZE reached.
+
+    def _on_data(self, data):
+        "Buffer incoming data."
+        assert self.data is None
+
+        limit = self.MAX_SIZE - self._bufsize
+        if len(data) > limit:
+            self.excess += len(data) - limit
+        self._buf.append(data[:limit])
+        self._bufsize += len(self._buf[-1])
+
+    def _close(self):
+        "Close the IOChannel and concatenate captured data."
+        super()._close()
+        self.data = b''.join(self._buf)
+
+
+class Spawner:
+    """A program spawner, using GLib.
+    """
+
+    def __init__(self, *argv, hasty=True, ondone=None):
+        """Spawn a process, capture its output, and trigger a callback.
+
+        GLib may use a fast posix_spawn() code path when hasty=True, but this
+        will also let the child inherit the parent's open file descriptors.
+        https://lazka.github.io/pgi-docs/GLib-2.0/functions.html
+        https://gitlab.gnome.org/GNOME/glib/blob/2.58.1/glib/gspawn.c#L736
+        """
+        flags = GLib.SpawnFlags.DO_NOT_REAP_CHILD | GLib.SpawnFlags.SEARCH_PATH
+        if hasty:
+            flags |= GLib.SpawnFlags.LEAVE_DESCRIPTORS_OPEN
+
+        self._pid, _, self._outfd, _ = GLib.spawn_async(
+            argv, flags=flags, standard_output=True)
+        GLib.child_watch_add(GLib.PRIORITY_DEFAULT, self._pid, self._done)
+
+        self.argv = argv
+        self.status = None  # Status from waitpid(). Use os.WIFEXITED() etc.
+        self.ondone = ondone
+
+    def _done(self, pid, status):
+        "Handle child exit."
+        GLib.spawn_close_pid(pid)
+        self.status = status
+        if self.ondone:
+            self.ondone(self)
+
+    def check_status(self):
+        "Raise GLib.Error if self.status indicates abnormal exit."
+        GLib.spawn_check_exit_status(self.status)
+
+    def kill(self, signo=signal.SIGHUP):
+        "Send a signal to the child process."
+        if not self.status:
+            os.kill(self._pid, signo)
+
+
+class SpawnCaptor(Spawner):
+    """A program output collector, using GLib.
+    """
+    def __init__(self, *argv, hasty=True, ondone=None):
+        """Spawn a process, capture its output, and trigger a callback.
+        """
+        super().__init__(*argv, hasty=hasty, ondone=ondone)
+        self._stdout = InputCaptor(self._outfd,
+            name=f"{argv[0]}.{self._pid}.{self._outfd}")
+
+    @property
+    def out(self):
+        "Return data from child's stdout."
+        return self._stdout.data
+
+
+class SpawnLineReader(Spawner):
+    """A program output line reader, using GLib.
+    """
+    def __init__(self, *argv, hasty=True, online):
+        """Spawn a process, capture its output, and trigger a callback.
+        """
+        super().__init__(*argv, hasty=hasty)
+        self._reader = InputLineReader(self._outfd, online,
+            name=f"{argv[0]}.{self._pid}.{self._outfd}")
+
+
+class LXCMonitor(SpawnLineReader):
+    """Spawn an lxc-monitor process and trigger callbacks based on its output.
+    """
+    # Match text like this:
+    # 'container name' changed state to [STARTING]
+    # This pattern supports spaces and \' in the container name.
+    # Unfortunately, neither lxc-ls nor ps -o lxc support those,
+    # so supporting them here doesn't do any good for now.
+    _PATTERN = re.compile(r"'((?:[^'\\]|\\.)*)'.+\[(.*)\]")
+
+    def __init__(self, onstart, onstop):
+        super().__init__('lxc-monitor', online=self._parse)
+        self._onstart = onstart
+        self._onstop = onstop
+
+    def _parse(self, data):
+        "Parse a line of lxc-monitor output and trigger callbacks."
+        try:
+            name, state = self._PATTERN.match(data.decode('utf-8')).groups()
+        except AttributeError:
+            raise ValueError("unexpected lxc-monitor output:", data)
+
+        if state == 'STARTING':
+            self._onstart(name)
+        elif state == 'STOPPED':
+            self._onstop(name)
+
+
+class SocketRequestHandler(InputLineReader):
+    """Incoming connection line reader & handler.
+    """
+    def __init__(self, conn, *, name=None):
+        """Initialize with file descriptor and callbacks.
+
+        :param conn:        An incoming connection.
+        :type  conn:        Gio.SocketConnection
+        :param name:        A name for this reader.
+        :type  name:        str or None
+        """
+        props = conn.props.socket.props
+        super().__init__(props.fd, self.handle_request,
+            name=name or f"sock.{props.fd}")
+
+        self.socketpath = props.local_address.props.path
+        self.rootdir, self.workdir = self.get_peer_dirs(conn)
+
+        self.conn = conn # Keep object referenced to avoid premature close
+        self.conn.props.socket.shutdown(False, True) # We never send
+
+    @staticmethod
+    def get_peer_dirs(conn):
+        """Determine the peer process' root directory and working directory.
+        If the peer is an lxc container process, its root will often differ
+        from the host's root.  A container's lxc.rootfs.path setting may be
+        a simple subdirectory of the host's root, but not always, since that
+        lxc setting also allows nbd:, overlayfs:, etc.
+        """
+        # Note: A (pid, uid, gid) struct can also be retrieved without Gio:
+        # getsockopt(socket.SOL_SOCKET, SO_PEERCRED, struct.calcsize('3i'))
+        # We use Gio to minimize imports & objects, but either approach is fine.
+        _, pid = conn.props.socket.get_option(
+            socket.SOL_SOCKET, socket.SO_PEERCRED)
+
+        workdir = os.readlink(f"/proc/{pid}/cwd")
+
+        # Find the directory being used as the process' root.
+        # Simply looking for a procfs mountinfo entry with a / mount point
+        # seems sufficient for our purposes.  This has not been tested with
+        # many filesystem/mount types, but should work for the cases we care
+        # about, since the peer's filesystem must be visible to us in order
+        # for our server socket to reside within it.
+        # Potential problem: paths containing spaces could break our parsing
+        # of mountinfo.  man proc(5) for the format.
+        for line in open(f"/proc/{pid}/mountinfo"):
+            fields = line.split()
+            if fields[4] == '/':
+                return fields[3], workdir
+
+        raise FileNotFoundError
+
+    def handle_request(self, data):
+        "Handle an incoming request line."
+        req = origreq = data.decode('utf-8').rstrip()
+
+        # Open requested URL in a browser tab
+        if urlparse(req).scheme:
+            webbrowser.open_new_tab(req)
+            return
+
+        # Resolve a relative path
+        if not req.startswith('/'):
+            req = os.path.join(self.workdir, req)
+
+        # Prepend the peer's root directory to the path it requested
+        if self.rootdir != '/':
+            req = os.path.normpath(self.rootdir + req)
+
+        # Open requested directory in a file manager
+        # (webbrowser.open() seems to work for this purpose.)
+        if os.path.isdir(req):
+            webbrowser.open(req)
+            return
+
+        print("Ignoring request on socket", self.socketpath,
+            "for unknown URL/directory:", origreq, file=sys.stderr)
+
+
+class SocketService(Gio.SocketService):
+    """Create a socket on the filesystem and handle requests sent to it.
+    """
+    def __init__(self, paths):
+        super().__init__()
+
+        for path in paths:
+            try:
+                if stat.S_ISSOCK(os.stat(path).st_mode):
+                    os.remove(path)
+            except FileNotFoundError:
+                pass
+            self.add_address(Gio.UnixSocketAddress.new(path),
+                type=Gio.SocketType.STREAM,
+                protocol=Gio.SocketProtocol.DEFAULT,
+                source_object=None)
+
+    def do_incoming(self, connection, _): #pylint:disable=arguments-differ
+        SocketRequestHandler(connection)
+
+
+@functools.total_ordering
+class LXCItem(Gtk.MenuItem):
+    "Menu item representing an lxc container or process running within."
+    def __init__(self, box, pid, label):
+        super().__init__()
+
+        if pid:
+            self.props.label = "  " + label
+        else:
+            self.props.label = label
+            self.get_child().set_markup(f"<b>{label}</b>")
+            self.props.sensitive = False
+
+        self.box = box
+        self.pid = pid
+        self.label = label
+
+    def __eq__(self, other):
+        if isinstance(other, tuple):
+            return (self.box, self.pid) == other
+        return NotImplemented
+
+    def __lt__(self, other):
+        if isinstance(other, tuple):
+            return (self.box, self.pid) < other
+        return NotImplemented
+
+    def do_activate(self, *args, **kwargs):
+        "Show a dialog box when this menu item is activated."
+        assert self.pid
+        dialog = Gtk.MessageDialog(
+            parent=self.get_toplevel(),
+            flags=0, # Gtk.DialogFlags.MODAL, DESTROY_WITH_PARENT
+            type=Gtk.MessageType.WARNING,  # INFO, WARNING, QUESTION, OTHER
+            buttons=Gtk.ButtonsType.YES_NO,
+            title=PROGRAM_NAME,
+            text="Terminate this process?",
+            secondary_text=f"<b>{self.label}</b> ({self.pid}) on {self.box}",
+            secondary_use_markup=True)
+        dialog.connect('response', self._on_dialog_response)
+        dialog.show()
+
+    def _on_dialog_response(self, dialog, responseid):
+        "Handle a dialog box response."
+        if responseid == Gtk.ResponseType.YES:
+            try:
+                os.kill(self.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        dialog.hide()
+
+
+class LXCMenu(Gtk.Menu):
+    "Menu of active lxc containers and their processes."
+    def __init__(self, uidranges, procnames):
+        "Initialize with a set of process names to watch."
+        super().__init__()
+
+        self.uidranges = uidranges
+        self.procnames = procnames
+        self.items = []
+
+        self.emptyitem = Gtk.MenuItem("(none)")
+        self.emptyitem.props.sensitive = False
+        self.append(self.emptyitem)
+
+        self.show_all()
+
+        self._lxcwait = False
+        self._pswait = False
+
+    def refresh(self, ondone):
+        "Refresh the menu of active containers & processes."
+        self._lxcwait = True
+        self._pswait = True
+        SpawnCaptor('lxc-ls', '--active',
+            ondone=functools.partial(self._parse_lxc, ondone=ondone))
+        SpawnCaptor('ps', '--no-headers', '-eo', 'lxc,ruid,pid,comm',
+            ondone=functools.partial(self._parse_ps, ondone=ondone))
+
+    def remove_item(self, box, pid=0):
+        "Remove an item with the given box name (and pid, if pid is nonzero)."
+        keepitems = []
+        for item in self.items:
+            if item.box != box or pid and item.pid != pid:
+                keepitems.append(item)
+            else:
+                self.remove(item)
+        self.items = keepitems
+
+    def _remove_stale_items(self, freshkeys, getkey):
+        "Remove items whose keys are not present in the given set."
+        freshitems = []
+        for item in self.items:
+            if getkey(item) in freshkeys:
+                freshitems.append(item)
+            else:
+                self.remove(item)
+        self.items = freshitems
+
+    def add_item(self, box, pid, label):
+        "Add an item, if it isn't already present."
+        key = (box, pid)
+        pos = bisect_left(self.items, key)
+        if pos < len(self.items) and self.items[pos] == key:
+            return
+        item = LXCItem(box, pid, label)
+        item.show()
+        self.insert(item, pos)
+        self.items.insert(pos, item)
+
+    def _add_items(self, newitems):
+        "Add/keep items from an iterable of (container-name, pid, label)."
+        for box, pid, label in newitems:
+            self.add_item(box, pid, label)
+
+    def _parse_lxc(self, spawner, ondone):
+        "Update menu with lxc-ls output."
+        spawner.check_status()
+
+        activeboxes = set(spawner.out.decode('utf-8').split())
+        self._remove_stale_items(activeboxes, lambda item: item.box)
+        self._add_items((box, 0, box) for box in activeboxes)
+
+        self._lxcwait = False
+        self._postproc(ondone)
+
+    def _parse_ps(self, spawner, ondone):
+        "Update menu with ps output."
+        spawner.check_status()
+
+        itemmap = {}
+        if spawner.out:
+            for line in spawner.out.decode('utf-8').splitlines():
+                box, uid, pid, command = line.split(None, 3)
+                if box == '-':
+                    continue
+                if not any(int(uid) in r for r in self.uidranges):
+                    continue
+                if self.procnames and command not in self.procnames:
+                    continue
+                itemmap[(box, int(pid))] = command
+                itemmap[(box, 0)] = box  # header for each box with processes
+
+        pids = set(key[1] for key in itemmap)
+        self._remove_stale_items(pids | {0}, lambda item: item.pid)
+        self._add_items((box, pid, label)
+            for (box, pid), label in itemmap.items())
+
+        self._pswait = False
+        self._postproc(ondone)
+
+    def _postproc(self, ondone):
+        "Post-process the menu, unless a refresh is still in progress."
+        if self._lxcwait or self._pswait:
+            return
+        self.emptyitem.props.visible = not self.items
+        if ondone:
+            ondone()
+
+
+class AppMenu(Gtk.Menu):
+    "Application menu."
+    def __init__(self, sicon):
+        super().__init__()
+        self.sicon = sicon
+        self.quititem = Gtk.MenuItem("Exit " + PROGRAM_NAME)
+        self.quititem.connect('activate', lambda _: sicon.quit())
+        self.append(self.quititem)
+        self.show_all()
+
+
+def load_config_lines(filename):
+    "Return a set of lines from the named config file."
+    try:
+        return set(open(f"{CONFIG_DIR}/{filename}").read().splitlines())
+    except FileNotFoundError:
+        return set()
+
+
+class WatcherStatusIcon(Gtk.StatusIcon):
+    """A system tray icon for watching lxc containers and their processes.
+    """
+    def __init__(self, loop, socketpaths):
+        super().__init__()
+
+        self.loop = loop
+
+        self.icon_off = load_icon_pixbuf(ICON_OFF_NAME)
+        self.icon_on = load_icon_pixbuf(ICON_ON_NAME)
+
+        self.appmenu = AppMenu(self)
+        self.uidranges = load_uid_ranges()
+        self.procnames = load_config_lines('procnames')
+        self.lxcmenu = LXCMenu(self.uidranges, self.procnames)
+        self.lxcmenu.refresh(ondone=self.update_icon)
+        self._lxcmon = LXCMonitor(
+            onstart=self.on_box_start, onstop=self.on_box_stop)
+
+        self.service = SocketService(socketpaths)
+
+    def quit(self):
+        "Request that the main loop stop."
+        self.loop.quit()
+
+    def kill_children(self):
+        "Kill worker processes."
+        try:
+            self._lxcmon.kill()
+        except ProcessLookupError:
+            pass
+
+    def do_popup_menu(self, button, time):  #pylint:disable=arguments-differ
+        "Open the application menu (right click)."
+        self.appmenu.popup(None, None, self.position_menu, self, button, time)
+
+    def do_activate(self):  #pylint:disable=arguments-differ
+        "Open the container list (left click)."
+        time = Gtk.get_current_event_time()
+        # Create a new menu to work around items not appearing in a modified one
+        self.lxcmenu = LXCMenu(self.uidranges, self.procnames)
+        self.lxcmenu.refresh(ondone=functools.partial(self.open_box_menu, time))
+
+    def open_box_menu(self, time):
+        "Update the status icon and pop up the box menu."
+        self.lxcmenu.popup(None, None, self.position_menu, self, 0, time)
+
+    def update_icon(self):
+        "Make the status icon represent reflect what is in the box menu."
+        boxcount = sum(1 for item in self.lxcmenu.items if not item.pid)
+
+        self.props.tooltip_text = "{} Active LXC Container{}".format(
+            boxcount or 'No', '' if boxcount == 1 else 's')
+
+        if self.lxcmenu.items:
+            if self.icon_on:
+                self.props.pixbuf = self.icon_on
+            else:
+                self.props.icon_name = 'recommended-driver'
+        else:
+            if self.icon_off:
+                self.props.pixbuf = self.icon_off
+            else:
+                self.props.icon_name = 'disable-device'
+
+    def on_box_start(self, box):
+        "Update the menu and icon to reflect a started container."
+        self.lxcmenu.add_item(box, 0, box)
+        self.update_icon()
+
+    def on_box_stop(self, box):
+        "Update the menu and icon to reflect a stopped container."
+        self.lxcmenu.remove_item(box)
+        self.update_icon()
+
+
+def prepare_clean_exit(loop):
+    "Install signal handlers for clean shutdown."
+    GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGTERM, loop.quit)
+    GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGHUP, loop.quit)
+
+    # Request a signal when our parent process exits, for cleanup on logout
+    libc = ctypes.CDLL('libc.so.6')
+    pr_set_pdeathsig = 1  # value found in <sys/prctl.h>
+    libc.prctl(pr_set_pdeathsig, signal.SIGTERM)  # man prctl(2) for details
+
+
+def main():
+    "Program entry point."
+
+    socketpaths = set(os.path.expanduser(path)
+        for path in load_config_lines('socketpaths'))
+
+    loop = GLib.MainLoop()
+    prepare_clean_exit(loop)
+    statusicon = WatcherStatusIcon(loop, socketpaths)
+
+    try:
+        loop.run()
+    except KeyboardInterrupt:
+        print()
+
+    # Clean up
+    statusicon.kill_children()
+    for path in socketpaths:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+
+
+if __name__ == '__main__':
+    main()
