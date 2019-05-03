@@ -363,29 +363,34 @@ class SocketRequestHandler(InputLineReader):
 
     def handle_request(self, data):
         "Handle an incoming request line."
-        req = origreq = data.decode('utf-8').rstrip()
+        request = data.decode('utf-8').rstrip()
 
-        # Open requested URL in a browser tab
-        if urlparse(req).scheme:
-            webbrowser.open_new_tab(req)
+        # Detect request format (URL or path)
+        parts = urlparse(request)
+        if not parts.scheme:
+            path = request
+        elif parts.scheme == 'file':
+            path = parts.path
+        else:
+            webbrowser.open_new_tab(request)
             return
 
         # Resolve a relative path
-        if not req.startswith('/'):
-            req = os.path.join(self.workdir, req)
+        if not path.startswith('/'):
+            path = os.path.join(self.workdir, path)
 
         # Prepend the peer's root directory to the path it requested
         if self.rootdir != '/':
-            req = os.path.normpath(self.rootdir + req)
+            path = os.path.normpath(self.rootdir + path)
 
         # Open requested directory in a file manager
         # (webbrowser.open() seems to work for this purpose.)
-        if os.path.isdir(req):
-            webbrowser.open(req)
+        if os.path.isdir(path):
+            webbrowser.open(path)
             return
 
         print("Ignoring request on socket", self.socketpath,
-            "for unknown URL/directory:", origreq, file=sys.stderr)
+            "for unknown URL/directory:", request, file=sys.stderr)
 
 
 class SocketService(Gio.SocketService):
