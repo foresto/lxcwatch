@@ -23,5 +23,12 @@ game launchers, which often like to open web pages to display news or file
 managers to show screenshots, but it can also make container admin tasks more
 convenient.
 
+The included x-www-browser.desktop file can be installed in a container
+(normally in ~/.local/share/applications or /usr/share/applications) to declare
+x-www-browser as a handler for URLs and directory paths. Gtk applications may
+not honor it by default, but the included register-browser-shim.sh script will
+register it with gio/gvfs. (The gio commands within require the libglib2.0-bin
+package on Debian, Ubuntu, and derivatives.)
+
 Requires python 3, [PyGObject](https://pygobject.readthedocs.io/), and the
 lxc 1.x tools lxc-monitor and lxc-ls. (The lxc-utils debian package has these.)
