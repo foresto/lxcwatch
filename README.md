@@ -24,11 +24,11 @@ managers to show screenshots, but it can also make container admin tasks more
 convenient.
 
 The included x-www-browser.desktop file can be installed in a container
-(normally in ~/.local/share/applications or /usr/share/applications) to declare
-x-www-browser as a handler for URLs and directory paths. Gtk applications may
-not honor it by default, but the included register-browser-shim.sh script will
-register it with gio/gvfs. (The gio commands within require the libglib2.0-bin
-package on Debian, Ubuntu, and derivatives.)
+(normally in ~/.local/share/applications or /usr/share/applications) to make
+x-www-browser available as a handler for URLs and directory paths. The included
+mimeapps.list file can be installed in ~/config (or its contents added to an
+existing ~/config/mimeapps.list file) to make x-www-browser the default handler
+for the same.
 
 Requires python 3, [PyGObject](https://pygobject.readthedocs.io/), and the
 lxc 1.x tools lxc-monitor and lxc-ls. (The lxc-utils debian package has these.)

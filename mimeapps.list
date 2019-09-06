@@ -1,0 +1,4 @@
+[Default Applications]
+inode/directory=x-www-browser.desktop
+x-scheme-handler/https=x-www-browser.desktop
+x-scheme-handler/http=x-www-browser.desktop
