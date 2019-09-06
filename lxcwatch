@@ -476,7 +476,7 @@ class LXCMenu(Gtk.Menu):
         self.procnames = procnames
         self.items = []
 
-        self.emptyitem = Gtk.MenuItem("(none)")
+        self.emptyitem = Gtk.MenuItem(label="(none)")
         self.emptyitem.props.sensitive = False
         self.append(self.emptyitem)
 
@@ -580,7 +580,7 @@ class AppMenu(Gtk.Menu):
     def __init__(self, sicon):
         super().__init__()
         self.sicon = sicon
-        self.quititem = Gtk.MenuItem("Exit " + PROGRAM_NAME)
+        self.quititem = Gtk.MenuItem(label="Exit " + PROGRAM_NAME)
         self.quititem.connect('activate', lambda _: sicon.quit())
         self.append(self.quititem)
         self.show_all()
