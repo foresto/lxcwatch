@@ -111,7 +111,9 @@ class InputReader:
         "Handle an input/hup event."
 
         if condition & GLib.IO_IN:
-            self._on_data(channel.read(self.MAX_SIZE))
+            data = channel.read(self.MAX_SIZE)
+            assert data or condition & GLib.IO_HUP
+            self._on_data(data)
 
         if condition & GLib.IO_HUP:
             self._close()
@@ -125,7 +127,7 @@ class InputReader:
 
     def _close(self):
         "Close the IOChannel and perform any final cleanup."
-        self._channel.close()
+        self._channel.shutdown(True)
 
 
 class InputLineReader(InputReader):
