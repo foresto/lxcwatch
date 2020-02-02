@@ -26,7 +26,7 @@ convenient.
 The included x-www-browser.desktop file can be installed in a container
 (normally in ~/.local/share/applications or /usr/share/applications) to make
 x-www-browser available as a handler for URLs and directory paths. The included
-mimeapps.list file can be installed in ~/config (or its contents added to an
+mimeapps.list file can be installed in ~/.config (or its contents added to an
 existing ~/config/mimeapps.list file) to make x-www-browser the default handler
 for the same.
 
