@@ -447,7 +447,7 @@ class LXCItem(Gtk.MenuItem):
         dialog = Gtk.MessageDialog(
             parent=self.get_toplevel(),
             flags=0, # Gtk.DialogFlags.MODAL, DESTROY_WITH_PARENT
-            type=Gtk.MessageType.WARNING,  # INFO, WARNING, QUESTION, OTHER
+            message_type=Gtk.MessageType.WARNING,  # INFO, WARNING, QUESTION, OTHER
             buttons=Gtk.ButtonsType.YES_NO,
             title=PROGRAM_NAME,
             text="Terminate this process?",
