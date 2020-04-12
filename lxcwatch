@@ -7,6 +7,7 @@ A system tray icon for watching processes in linux containers.
 
 from bisect import bisect_left
 import ctypes
+from dataclasses import dataclass
 import functools
 import getpass
 import os
@@ -281,6 +282,148 @@ class SpawnLineReader(Spawner):
             name=f"{argv[0]}.{self._pid}.{self._outfd}")
 
 
+@dataclass
+class ProcData:
+    """Process information, such as command and lxc container name.
+    """
+    command: str = None
+    lxcname: str = None
+
+class ProcLister:
+    """A process enumerator, using GLib.
+    """
+    def __init__(self, uidranges=None, procnames=None, ondone=None):
+        """Enumerate processes, save some details, and trigger a callback.
+        """
+        self.uidranges = uidranges
+        self.procnames = procnames
+        self.ondone = ondone
+        self.procs = {}  # {pid: ProcData}
+
+        self._procs_known = {}
+        self._gfile = Gio.File.new_for_path('/proc')
+        self._gfile.enumerate_children_async(
+            attributes=','.join((
+                Gio.FILE_ATTRIBUTE_UNIX_UID,
+                Gio.FILE_ATTRIBUTE_STANDARD_TYPE,
+                Gio.FILE_ATTRIBUTE_STANDARD_NAME)),
+            flags=Gio.FileQueryInfoFlags.NONE,
+            io_priority=GLib.PRIORITY_DEFAULT,
+            cancellable=None,
+            callback=self._got_enumerator)
+
+    def _got_enumerator(self, gfile, result):
+        """Finish file enumerator retrieval, and enumerate files.
+        """
+        enumerator = gfile.enumerate_children_finish(result)
+        self._get_more_files(enumerator)
+
+    def _get_more_files(self, enumerator):
+        """Request a batch of files from the enumerator.
+        """
+        enumerator.next_files_async(
+            num_files=100,
+            io_priority=GLib.PRIORITY_DEFAULT,
+            cancellable=None,
+            callback=self._got_files_info)
+
+    def _got_files_info(self, enumerator, result):
+        """Gather info from a batch of files.
+        """
+        infos = enumerator.next_files_finish(result)
+        if not infos:
+            self._maybe_done()
+            return
+
+        for info in infos:
+
+            # Skip non-directories
+            if info.get_file_type() != Gio.FileType.DIRECTORY:
+                continue
+
+            # Skip names that do not look like pids
+            name = info.get_name()
+            try:
+                pid = int(name)
+            except ValueError:
+                continue
+
+            # Skip uids outside our expected ranges
+            uid = info.get_attribute_uint32(Gio.FILE_ATTRIBUTE_UNIX_UID)
+            if self.uidranges:
+                if not any(int(uid) in r for r in self.uidranges):
+                    continue
+
+            # Get the command string
+            self._procs_known[pid] = ProcData()
+            command_file = self._gfile.get_child(name).get_child('comm')
+            command_file.load_contents_async(None, self._got_command, pid)
+
+        self._get_more_files(enumerator)
+
+    def _got_command(self, command_file, result, pid):
+        """Save the command string and get the lxc container name.
+        """
+        try:
+            _, contents, _ = command_file.load_contents_finish(result)
+        except GLib.Error:
+            # Failed to read; assume the process exited and move on
+            del self._procs_known[pid]
+            self._maybe_done()
+            return
+
+        # Skip commands don't match our expected process names
+        command = contents.decode('utf-8').splitlines()[0]
+        if self.procnames and command not in self.procnames:
+            del self._procs_known[pid]
+            self._maybe_done()
+            return
+
+        # Save the command string
+        self._procs_known[pid].command = command
+
+        # Get the lxc container name
+        cgroup_file = command_file.get_parent().get_child('cgroup')
+        cgroup_file.load_contents_async(None, self._got_cgroup, pid)
+
+    # This regexp is based on procps C code for parsing the container name:
+    # https://gitlab.com/procps-ng/procps/-/blob/master/proc/readproc.c#L891
+    _LXCPATTERN = re.compile(r'(?:lxc\.payload/|lxc/)([^/\n]+)')
+
+    def _got_cgroup(self, cgroup_file, result, pid):
+        """Save the lxc container name.
+        """
+        try:
+            _, contents, _ = cgroup_file.load_contents_finish(result)
+        except GLib.Error:
+            # Failed to read; assume the process exited and move on
+            del self._procs_known[pid]
+            self._maybe_done()
+            return
+
+        # Skip pids that are not in a container
+        match = self._LXCPATTERN.search(contents.decode('utf-8'))
+        if not match:
+            del self._procs_known[pid]
+            self._maybe_done()
+            return
+
+        # Save the lxc container name
+        self._procs_known[pid].lxcname = match[1]
+
+        # Mark this pid as done
+        self.procs[pid] = self._procs_known.pop(pid)
+        self._maybe_done()
+
+    def _maybe_done(self):
+        """Check for outstanding tasks, and report if we're done.
+        """
+        if self._procs_known:
+            return
+        if self.ondone:
+            self.ondone(self)
+
+
 class LXCMonitor(SpawnLineReader):
     """Spawn an lxc-monitor process and trigger callbacks based on its output.
     """
@@ -483,16 +626,16 @@ class LXCMenu(Gtk.Menu):
         self.show_all()
 
         self._lxcwait = False
-        self._pswait = False
+        self._procwait = False
 
     def refresh(self, ondone):
         "Refresh the menu of active containers & processes."
         self._lxcwait = True
-        self._pswait = True
+        self._procwait = True
         SpawnCaptor('lxc-ls', '--active',
             ondone=functools.partial(self._parse_lxc, ondone=ondone))
-        SpawnCaptor('ps', '--no-headers', '-eo', 'lxc,ruid,pid,comm',
-            ondone=functools.partial(self._parse_ps, ondone=ondone))
+        ProcLister(uidranges=self.uidranges, procnames=self.procnames,
+            ondone=functools.partial(self._parse_procs, ondone=ondone))
 
     def remove_item(self, box, pid=0):
         "Remove an item with the given box name (and pid, if pid is nonzero)."
@@ -539,36 +682,28 @@ class LXCMenu(Gtk.Menu):
         self._add_items((box, 0, box) for box in activeboxes)
 
         self._lxcwait = False
-        self._postproc(ondone)
+        self._maybe_done(ondone)
 
-    def _parse_ps(self, spawner, ondone):
-        "Update menu with ps output."
-        spawner.check_status()
+    def _parse_procs(self, proclister, ondone):
+        "Update menu with /proc filesystem data."
 
         itemmap = {}
-        if spawner.out:
-            for line in spawner.out.decode('utf-8').splitlines():
-                box, uid, pid, command = line.split(None, 3)
-                if box == '-':
-                    continue
-                if not any(int(uid) in r for r in self.uidranges):
-                    continue
-                if self.procnames and command not in self.procnames:
-                    continue
-                itemmap[(box, int(pid))] = command
-                itemmap[(box, 0)] = box  # header for each box with processes
+        for pid, procdata in proclister.procs.items():
+            box = procdata.lxcname
+            itemmap[(box, pid)] = procdata.command
+            itemmap[(box, 0)] = box  # header for each box with processes
 
         pids = set(key[1] for key in itemmap)
         self._remove_stale_items(pids | {0}, lambda item: item.pid)
         self._add_items((box, pid, label)
             for (box, pid), label in itemmap.items())
 
-        self._pswait = False
-        self._postproc(ondone)
+        self._procwait = False
+        self._maybe_done(ondone)
 
-    def _postproc(self, ondone):
+    def _maybe_done(self, ondone):
         "Post-process the menu, unless a refresh is still in progress."
-        if self._lxcwait or self._pswait:
+        if self._lxcwait or self._procwait:
             return
         self.emptyitem.props.visible = not self.items
         if ondone:
