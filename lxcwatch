@@ -724,7 +724,8 @@ class AppMenu(Gtk.Menu):
 def load_config_lines(filename):
     "Return a set of lines from the named config file."
     try:
-        return set(open(f"{CONFIG_DIR}/{filename}").read().splitlines())
+        lines = open(f"{CONFIG_DIR}/{filename}").read().splitlines()
+        return set(line for line in lines if line)
     except FileNotFoundError:
         return set()
 
