@@ -386,9 +386,10 @@ class ProcLister:
         cgroup_file = command_file.get_parent().get_child('cgroup')
         cgroup_file.load_contents_async(None, self._got_cgroup, pid)
 
-    # This regexp is based on procps C code for parsing the container name:
+    # This regexp is based on procps C code for parsing the container name
+    # from /proc/*/cgroup
     # https://gitlab.com/procps-ng/procps/-/blob/master/proc/readproc.c#L891
-    _LXCPATTERN = re.compile(r'(?:lxc\.payload/|lxc/)([^/\n]+)')
+    _LXCPATTERN = re.compile(r'(lxc\.payload|lxc)[./]([^/\n]+)')
 
     def _got_cgroup(self, cgroup_file, result, pid):
         """Save the lxc container name.
@@ -409,7 +410,7 @@ class ProcLister:
             return
 
         # Save the lxc container name
-        self._procs_known[pid].lxcname = match[1]
+        self._procs_known[pid].lxcname = match[2]
 
         # Mark this pid as done
         self.procs[pid] = self._procs_known.pop(pid)
