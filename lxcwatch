@@ -386,10 +386,39 @@ class ProcLister:
         cgroup_file = command_file.get_parent().get_child('cgroup')
         cgroup_file.load_contents_async(None, self._got_cgroup, pid)
 
-    # This regexp is based on procps C code for parsing the container name
-    # from /proc/*/cgroup
-    # https://gitlab.com/procps-ng/procps/-/blob/master/proc/readproc.c#L891
-    _LXCPATTERN = re.compile(r'(lxc\.payload|lxc)[./]([^/\n]+)')
+    # This regexp parses the container name from /proc/*/cgroup
+    #
+    # We want it to match any of the following...
+    #
+    # Nested containers, both privileged & unprivileged:
+    #
+    # '10:cpuset:/lxc/boxP/lxc/boxP-nest',
+    # '10:cpuset:/user.slice/user-1.slice/sess-c2.scope/lxc/boxU/lxc/boxU-nest',
+    #
+    # Containers with cgroups appended to a line:
+    #
+    # '10:cpuset:/lxc/boxP/lxc/boxP-nest/MY-NEW-CGROUP',
+    #
+    # Unexpected line contents:
+    #
+    # '1:cpuset,cpu,cpuacct,devices,freezer,net_cls,blkio,net_prio:/lxc/boxP',
+    #
+    # Container name prefixes from various lxc versions:
+    #   lxc.payload.  # with lxc-4.0.0
+    #   lxc.payload/  # through lxc-3.2.1
+    #   lxc/          # through lxc-3.0.3
+    #
+    # '9:memory:/user.slice/user-1000.slice/session-c2.scope/lxc.payload/boxU',
+    # '9:memory:/user.slice/user-1000.slice/session-c2.scope/lxc.payload.boxU',
+    #
+    # We want it to avoid the following...
+    #
+    # '9:memory:/user.slice/user-1000.slice/session-c2.scope/lxc.monitor.boxU',
+    #
+    # Inspired by the procps project: readproc.c: lxc_containers() function:
+    # https://gitlab.com/procps-ng/procps/-/blob/e319650/proc/readproc.c#L891
+    #
+    _LXCPATTERN = re.compile(r'(/lxc(?:/|\.payload/|\.payload\.)([^./\n]+))+')
 
     def _got_cgroup(self, cgroup_file, result, pid):
         """Save the lxc container name.
